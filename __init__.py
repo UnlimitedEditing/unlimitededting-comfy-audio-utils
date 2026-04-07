@@ -5,6 +5,7 @@ import subprocess
 from typing import Any, Optional, Tuple
 import tempfile
 import numpy as np  # Added for data manipulation
+import torch
 
 # ComfyUI temp directory helper
 try:
@@ -373,13 +374,88 @@ class AudioDurationNode:
         )
 
 
+class AudioAddSilenceNode:
+    """Add silence before and/or after an AUDIO input using millisecond values."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "audio": ("AUDIO",),
+                "prepend_silence": (
+                    "FLOAT",
+                    {"default": 100.0, "min": 0.0, "max": 600000.0, "step": 1.0},
+                ),
+                "append_silence": (
+                    "FLOAT",
+                    {"default": 200.0, "min": 0.0, "max": 600000.0, "step": 1.0},
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("AUDIO",)
+    RETURN_NAMES = ("audio",)
+    FUNCTION = "run"
+    CATEGORY = "audio/utils"
+
+    def _sample_rate_to_float(self, sample_rate: Any) -> float:
+        try:
+            return float(sample_rate.item()) if hasattr(sample_rate, "item") else float(sample_rate)
+        except Exception as e:
+            raise RuntimeError(f"Invalid audio sample rate: {sample_rate!r}") from e
+
+    def run(self, audio: Any, prepend_silence: float, append_silence: float):
+        if not isinstance(audio, dict):
+            raise RuntimeError("Expected AUDIO input to be a dictionary-like audio object.")
+
+        waveform = audio.get("waveform")
+        sample_rate = audio.get("sample_rate")
+
+        if waveform is None or sample_rate is None:
+            raise RuntimeError("AUDIO input must contain both 'waveform' and 'sample_rate'.")
+
+        if not isinstance(waveform, torch.Tensor):
+            waveform = torch.as_tensor(waveform)
+
+        sample_rate_value = self._sample_rate_to_float(sample_rate)
+        if sample_rate_value <= 0:
+            raise RuntimeError(f"Invalid audio sample rate: {sample_rate_value}")
+
+        prepend_frames = max(0, int(round((float(prepend_silence) / 1000.0) * sample_rate_value)))
+        append_frames = max(0, int(round((float(append_silence) / 1000.0) * sample_rate_value)))
+
+        if prepend_frames == 0 and append_frames == 0:
+            return (audio,)
+
+        padded = waveform
+        if prepend_frames > 0:
+            prepend_shape = list(padded.shape)
+            prepend_shape[-1] = prepend_frames
+            prepend_tensor = padded.new_zeros(prepend_shape)
+            padded = torch.cat((prepend_tensor, padded), dim=-1)
+
+        if append_frames > 0:
+            append_shape = list(padded.shape)
+            append_shape[-1] = append_frames
+            append_tensor = padded.new_zeros(append_shape)
+            padded = torch.cat((padded, append_tensor), dim=-1)
+
+        output_audio = dict(audio)
+        output_audio["waveform"] = padded
+        output_audio["sample_rate"] = sample_rate
+
+        return (output_audio,)
+
+
 # Expose node(s) to ComfyUI
 NODE_CLASS_MAPPINGS = {
     "Audio Duration": AudioDurationNode,
+    "Audio Add Silence": AudioAddSilenceNode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "Audio Duration": "Audio - Duration",
+    "Audio Add Silence": "Audio - Add Silence",
 }
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]

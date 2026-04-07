@@ -1,9 +1,14 @@
 ![Audio Duration Screenshot](https://github.com/scofano/comfy-audio-duration/raw/main/screenshot.png)
 
 
-# Audio Duration (ComfyUI Custom Node)
+# Audio Utilities (ComfyUI Custom Nodes)
 
-Returns the duration of an audio source, which can be provided either as a filesystem path or as raw audio data (samples and sample rate) from an upstream node. Duration calculation primarily uses `ffprobe` (from FFmpeg) for paths, or calculates the duration directly from samples/SR if no path is available.
+This custom node package currently includes two audio utility nodes:
+
+- **Audio Duration**: returns the duration of an audio source, which can be provided either as a filesystem path or as raw audio data (samples and sample rate) from an upstream node.
+- **Audio Add Silence**: receives an `AUDIO` input and outputs the same audio with optional silence prepended and/or appended in milliseconds.
+
+Duration calculation primarily uses `ffprobe` (from FFmpeg) for paths, or calculates the duration directly from samples/SR if no path is available.
 
 ## Install
 1. Ensure FFmpeg is installed and `ffprobe` is on your PATH.
@@ -16,7 +21,9 @@ Returns the duration of an audio source, which can be provided either as a files
 
 4.  Restart ComfyUI.
 
-## Node
+## Nodes
+
+### Audio Duration
 
 **Category:** `audio/utils`
 **Name:** `Audio Duration`
@@ -34,6 +41,29 @@ The node will prioritize a connected `audio` object over the `audio_path` string
 2.  `seconds_float` (FLOAT)
 3.  `minutes_int` (INT)
 4.  `minutes_float` (FLOAT)
+
+### Audio Add Silence
+
+**Category:** `audio/utils`
+**Name:** `Audio Add Silence`
+
+#### Inputs
+
+- `audio` (AUDIO): Input audio object.
+- `prepend_silence` (FLOAT): Silence to add before the audio, in milliseconds. Default: `100.0`.
+- `append_silence` (FLOAT): Silence to add after the audio, in milliseconds. Default: `200.0`.
+
+#### Output
+
+1. `audio` (AUDIO)
+
+#### Behavior
+
+- The node adds zero-valued audio samples to the beginning and/or end of the input waveform.
+- The silence length is calculated from the input audio sample rate and the selected millisecond values.
+- If `prepend_silence` is `0`, no silence is added at the start.
+- If `append_silence` is `0`, no silence is added at the end.
+- If both values are `0`, the original audio is returned unchanged.
 
 ## Troubleshooting
 
