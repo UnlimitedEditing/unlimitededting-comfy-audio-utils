@@ -67,6 +67,85 @@ class AudioDurationNode:
 
     # ------------------------- helpers -------------------------
 
+    def _samples_to_numpy(self, samples: Any) -> Optional[np.ndarray]:
+        """Convert common tensor/sequence audio containers to a numpy array."""
+        if samples is None:
+            return None
+
+        if hasattr(samples, "detach") and hasattr(samples, "cpu"):
+            samples = samples.detach().cpu().numpy()
+        elif hasattr(samples, "numpy"):
+            samples = samples.numpy()
+
+        return np.asarray(samples)
+
+    def _normalize_audio_array(self, samples: Any) -> Optional[np.ndarray]:
+        """Return audio as [frames] or [frames, channels] without flattening channels.
+
+        ComfyUI audio tensors are commonly shaped like [batch, channels, frames].
+        This helper removes batch dimensions and preserves channel layout so downstream
+        duration checks and temporary WAV exports do not accidentally serialize
+        stereo audio as one long mono stream.
+        """
+        samples = self._samples_to_numpy(samples)
+        if samples is None or samples.size == 0:
+            return None
+
+        samples = np.squeeze(samples)
+        if samples.ndim == 0:
+            return None
+
+        while samples.ndim > 2:
+            if samples.shape[0] == 1:
+                samples = samples[0]
+                continue
+            if samples.shape[-1] == 1:
+                samples = samples[..., 0]
+                continue
+            # If multiple batch items are present, use the first item rather than
+            # flattening batches/channels into a longer waveform.
+            samples = samples[0]
+
+        if samples.ndim == 1:
+            return samples
+
+        # Normalize 2D arrays to scipy's expected [frames, channels] layout.
+        if samples.shape[0] <= 8 and samples.shape[1] > 8:
+            return samples.T
+
+        return samples
+
+    def _extract_channel_count(self, audio_obj: Any) -> Optional[int]:
+        """Extract declared channel count when the audio object provides one."""
+        if audio_obj is None:
+            return None
+
+        if isinstance(audio_obj, dict):
+            for key in ("channels", "num_channels", "n_channels"):
+                value = audio_obj.get(key)
+                if value is not None:
+                    try:
+                        return int(value.item()) if hasattr(value, "item") else int(value)
+                    except Exception:
+                        pass
+
+        if isinstance(audio_obj, (list, tuple)) and len(audio_obj) >= 3:
+            value = audio_obj[2]
+            try:
+                return int(value.item()) if hasattr(value, "item") else int(value)
+            except Exception:
+                pass
+
+        for attr in ("channels", "num_channels", "n_channels"):
+            try:
+                value = getattr(audio_obj, attr)
+                if value is not None:
+                    return int(value.item()) if hasattr(value, "item") else int(value)
+            except Exception:
+                pass
+
+        return None
+
     def _extract_samples_sr(self, audio_obj):
         """Return (samples, sr) or (None, None) from many possible AUDIO shapes, including
         nested dicts and batched lists."""
@@ -178,45 +257,18 @@ class AudioDurationNode:
         except Exception:
             sr = float(sr)
 
-        # Resolve number of frames for common containers (list/tuple/np/torch)
-        try:
-            import numpy as _np  # optional
-        except Exception:
-            _np = None
+        normalized = self._normalize_audio_array(samples)
+        if normalized is None:
+            return None
 
-        try:
-            import torch as _torch  # optional
-        except Exception:
-            _torch = None
+        channels = self._extract_channel_count(audio_obj)
 
-        n_frames = None
-        try:
-            if _torch is not None and isinstance(samples, _torch.Tensor):
-                samples = samples.detach().cpu().numpy()  # Convert to numpy
-                _np = np
-
-            if _np is not None and isinstance(samples, _np.ndarray):
-                # Ensure it's a 2D array [N_frames, N_channels] or [N_frames]
-                if samples.ndim == 1:
-                    n_frames = samples.shape[0]
-                elif samples.ndim == 2:
-                    # Assume the longer dimension is the number of frames
-                    n_frames = max(samples.shape)
-            else:
-                # Python sequence fallback
-                if (
-                    hasattr(samples, "__getitem__")
-                    and len(samples) > 0
-                    and hasattr(samples[0], "__len__")
-                ):
-                    n_frames = max(len(ch) for ch in samples)
-                else:
-                    n_frames = len(samples)
-        except Exception:
-            try:
-                n_frames = len(samples)
-            except Exception:
-                return None
+        if normalized.ndim == 1:
+            n_frames = normalized.shape[0]
+            if channels is not None and channels > 1 and n_frames % channels == 0:
+                n_frames //= channels
+        else:
+            n_frames = normalized.shape[0]
 
         if not n_frames or sr <= 0:
             return None
@@ -249,7 +301,9 @@ class AudioDurationNode:
 
     # ------------------------- NEW HELPER FUNCTION -------------------------
 
-    def _save_audio_to_temp(self, samples: Any, sr: float) -> Optional[str]:
+    def _save_audio_to_temp(
+        self, samples: Any, sr: float, channels: Optional[int] = None
+    ) -> Optional[str]:
         """
         Saves samples/sr to a temporary WAV file in the ComfyUI temp folder.
 
@@ -260,31 +314,26 @@ class AudioDurationNode:
             if sr <= 0:
                 return None
 
-            # Convert to numpy array if it's not already
-            if hasattr(samples, "detach") and hasattr(samples, "cpu") and hasattr(
-                samples, "numpy"
-            ):
-                samples = samples.detach().cpu().numpy()
-            elif hasattr(samples, "numpy"):
-                samples = samples.numpy()
-            samples = np.asarray(samples)
+            samples = self._normalize_audio_array(samples)
+            if samples is None or samples.size == 0:
+                return None
 
-            # Convert shape: from [Channels, Frames] or [Frames] to [Frames, Channels]
-            if samples.ndim == 2 and samples.shape[0] < samples.shape[1]:
-                # Assuming [C, N] is common in torch/some loaders, convert to [N, C]
-                samples = samples.T
-            elif samples.ndim > 2:
-                # Reduce to 2D by flattening extra dimensions or taking the first batch item
-                if samples.shape[-1] < 10:
-                    samples = samples.reshape(-1, samples.shape[-1])
-                else:
-                    samples = samples.flatten()
+            if samples.ndim == 1 and channels is not None and channels > 1:
+                n_frames = samples.shape[0] // channels
+                if n_frames > 0:
+                    samples = samples[: n_frames * channels].reshape(n_frames, channels)
 
             # Normalize data type and range for WAV saving (e.g., int16)
-            max_val = np.abs(samples).max()
-            if max_val <= 1.0:
-                # Normalize float samples to int16 range if they are floats
-                samples = (samples * 32767).astype(np.int16)
+            if np.issubdtype(samples.dtype, np.floating):
+                samples = np.nan_to_num(samples, nan=0.0, posinf=1.0, neginf=-1.0)
+                max_val = float(np.abs(samples).max()) if samples.size else 0.0
+                if max_val <= 1.0:
+                    samples = np.clip(samples, -1.0, 1.0)
+                    samples = (samples * 32767).astype(np.int16)
+                else:
+                    samples = np.clip(samples, -32768.0, 32767.0).astype(np.int16)
+            elif samples.dtype != np.int16:
+                samples = np.clip(samples, -32768, 32767).astype(np.int16)
 
             # Use ComfyUI's temp directory structure if available
             if folder_paths is not None:
@@ -331,15 +380,19 @@ class AudioDurationNode:
             # b) If we can extract samples/sr, save a temp WAV in ComfyUI temp dir
             samples, sr = self._extract_samples_sr(audio)
             if samples is not None and sr is not None:
-                temp = self._save_audio_to_temp(samples, sr)
+                seconds = self._duration_from_samples(audio)
+                channels = self._extract_channel_count(audio)
+
+                temp = self._save_audio_to_temp(samples, sr, channels)
                 if temp:
                     temp_wav_path = temp
-                    # If we didn't find another path, use this temp file for probing
-                    if path_to_probe is None:
+                    # Only rely on the temp file when direct duration calculation
+                    # was not possible and we have no original file path to probe.
+                    if path_to_probe is None and seconds is None:
                         path_to_probe = temp
 
             # c) If no path yet, try duration from samples/dict metadata
-            if path_to_probe is None:
+            if seconds is None and path_to_probe is None:
                 seconds = self._duration_from_samples(audio)
 
         # If we still don't have seconds, probe by path (original or temp)
