@@ -500,15 +500,22 @@ class AudioAddSilenceNode:
         return (output_audio,)
 
 
+from .load_audio_any import (
+    NODE_CLASS_MAPPINGS as _LOAD_AUDIO_ANY_CLASS_MAPPINGS,
+    NODE_DISPLAY_NAME_MAPPINGS as _LOAD_AUDIO_ANY_DISPLAY_MAPPINGS,
+)
+
 # Expose node(s) to ComfyUI
 NODE_CLASS_MAPPINGS = {
     "Audio Duration": AudioDurationNode,
     "Audio Add Silence": AudioAddSilenceNode,
+    **_LOAD_AUDIO_ANY_CLASS_MAPPINGS,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "Audio Duration": "Audio - Duration",
     "Audio Add Silence": "Audio - Add Silence",
+    **_LOAD_AUDIO_ANY_DISPLAY_MAPPINGS,
 }
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
