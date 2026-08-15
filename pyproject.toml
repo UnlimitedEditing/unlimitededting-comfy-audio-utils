@@ -1,7 +1,7 @@
 [project]
-name = "comfy-audio-duration"
-description = "ComfyUI audio utility nodes that provide audio duration inspection and optional silence padding for AUDIO inputs."
-version = "1.0.0"
+name = "unlimitedediting-comfy-audio-utils"
+description = "UnlimitedEditing fork of comfy-audio-duration, with LoadAudioAny added. ComfyUI audio utility nodes: duration inspection, silence padding, and URL-or-local audio loading for AUDIO inputs."
+version = "1.1.0"
 license = { file = "LICENSE" }
 # classifiers = [
 #     # For OS-independent nodes (works on all operating systems)
@@ -26,14 +26,17 @@ dependencies = [
 ]
 
 [project.urls]
-Repository = "https://github.com/scofano/comfy-audio-duration"
-#  Used by Comfy Registry https://registry.comfy.org
-Documentation = "https://github.com/scofano/comfy-audio-duration/wiki"
-"Bug Tracker" = "https://github.com/scofano/comfy-audio-duration/issues"
+Repository = "https://github.com/UnlimitedEditing/comfy-audio-duration"
+"Original Upstream" = "https://github.com/scofano/comfy-audio-duration"
+"Bug Tracker" = "https://github.com/UnlimitedEditing/comfy-audio-duration/issues"
 
-[tool.comfy]
-PublisherId = "dansco"
-DisplayName = "Audio Utilities"
-Icon = ""
-includes = []
-# "requires-comfyui" = ">=1.0.0"  # ComfyUI version compatibility
+# NOTE: the [tool.comfy] Comfy Registry publishing block (PublisherId "dansco",
+# package "comfy-audio-duration") was intentionally removed. Graydient jobs on two
+# separate, freshly-registered workflow slugs both failed with
+# "Node 'Load Audio Any' not found" despite the node being present and verified live on
+# this fork's main branch -- ruling out simple per-machine stale-checkout caching (the
+# documented fresh-slug workaround didn't help). Leading suspect: ComfyUI-Manager
+# resolving this package by registry identity (name+PublisherId) rather than literally
+# git-cloning the `requirements.github` URL, landing back on the original
+# dansco/comfy-audio-duration registry entry instead of this fork. Renaming the package
+# and dropping the registry-publishing block breaks that possible identity match.
