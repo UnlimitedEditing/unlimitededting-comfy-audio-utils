@@ -153,12 +153,44 @@ class LoadAudioAny:
         )
 
 
+class LoadAudioAnyOptional(LoadAudioAny):
+    """
+    Same resolution logic as LoadAudioAny (URL / mangled-Telegram / local-file, in
+    that order across the same three inputs), for graphs where a reference/source
+    clip is genuinely OPTIONAL (e.g. AuK's instruct-TTS mode, which has no
+    reference audio at all) -- unlike LoadAudioAny, which always raises when all
+    three inputs are empty (correct for every OTHER caller in this org's
+    workflows, where audio is required; added here as a separate class rather than
+    changing LoadAudioAny's behavior, so no existing deployed workflow is affected).
+
+    Returns (None,) instead of raising when all three inputs are empty. This is
+    safe to wire into any optional AUDIO input -- see e.g. AuK's own
+    AuKGenerateEdit.input_audio, whose node code explicitly handles
+    `if audio is None: return None` for exactly this case.
+    """
+
+    def run(self, audio_source="", audio_source_alt="", audio_source_filename=""):
+        for value, label in (
+            (audio_source, "audio_source"),
+            (audio_source_alt, "audio_source_alt"),
+            (audio_source_filename, "audio_source_filename"),
+        ):
+            result = _resolve_reference_audio(value, label)
+            if result is not None:
+                waveform, sample_rate = result
+                return ({"waveform": waveform.unsqueeze(0), "sample_rate": sample_rate},)
+
+        return (None,)
+
+
 NODE_CLASS_MAPPINGS = {
     "Load Audio Any": LoadAudioAny,
+    "Load Audio Any Optional": LoadAudioAnyOptional,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "Load Audio Any": "Audio - Load (URL or Local)",
+    "Load Audio Any Optional": "Audio - Load (URL or Local, Optional)",
 }
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
