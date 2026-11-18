@@ -270,11 +270,42 @@ class LoadAudioAnyStereoOptional(LoadAudioAnyStereo):
         return (None, False)
 
 
+class AudioRouteTwoWay:
+    """
+    Send an AUDIO to exactly ONE of two outputs and block the other, so a Save node wired to the
+    blocked output simply does not run (ExecutionBlocker, same pattern as VoiceBankArchiveEcho).
+    Use it to let a numeric field (Graydient slot) choose the output file format:
+    choice 0 -> audio_a (e.g. SaveAudioOpus), choice 1 -> audio_b (e.g. SaveAudioMP3).
+    Any other value is treated as 1 if >= 1, else 0.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "audio": ("AUDIO",),
+                "choice": ("INT", {"default": 0, "min": 0, "max": 1, "step": 1}),
+            },
+        }
+
+    RETURN_TYPES = ("AUDIO", "AUDIO")
+    RETURN_NAMES = ("audio_a", "audio_b")
+    FUNCTION = "run"
+    CATEGORY = "audio/utils"
+
+    def run(self, audio, choice=0):
+        from comfy_execution.graph_utils import ExecutionBlocker
+        if int(choice) >= 1:
+            return (ExecutionBlocker(None), audio)
+        return (audio, ExecutionBlocker(None))
+
+
 NODE_CLASS_MAPPINGS = {
     "Load Audio Any": LoadAudioAny,
     "Load Audio Any Optional": LoadAudioAnyOptional,
     "Load Audio Any Stereo": LoadAudioAnyStereo,
     "Load Audio Any Stereo Optional": LoadAudioAnyStereoOptional,
+    "Audio Route Two Way": AudioRouteTwoWay,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -282,6 +313,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Load Audio Any Optional": "Audio - Load (URL or Local, Optional)",
     "Load Audio Any Stereo": "Audio - Load Stereo (URL or Local)",
     "Load Audio Any Stereo Optional": "Audio - Load Stereo (URL or Local, Optional)",
+    "Audio Route Two Way": "Audio - Route To One Of Two Outputs",
 }
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
