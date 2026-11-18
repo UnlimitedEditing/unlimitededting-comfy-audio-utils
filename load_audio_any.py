@@ -241,16 +241,47 @@ class LoadAudioAnyStereo:
         )
 
 
+class LoadAudioAnyStereoOptional(LoadAudioAnyStereo):
+    """
+    LoadAudioAnyStereo for graphs where the clip is genuinely OPTIONAL (e.g. a
+    music workflow that does audio-to-audio when a clip is attached and plain
+    text-to-music when it is not).
+
+    Same resolution (first non-empty of the same three inputs, stereo float32 at
+    `sample_rate`), but when all three are empty it does NOT raise: it returns
+    (None, False). Output 1 `has_audio` (BOOLEAN) drives a lazy ComfySwitchNode,
+    so the branch that consumes the AUDIO output is never evaluated when empty.
+    Added as a separate class so no deployed workflow changes behavior.
+    """
+
+    RETURN_TYPES = ("AUDIO", "BOOLEAN")
+    RETURN_NAMES = ("audio", "has_audio")
+
+    def run(self, audio_source="", audio_source_alt="", audio_source_filename="", sample_rate=44100):
+        for value, label in (
+            (audio_source, "audio_source"),
+            (audio_source_alt, "audio_source_alt"),
+            (audio_source_filename, "audio_source_filename"),
+        ):
+            result = _resolve_reference_audio(value, label, sample_rate, channels=2)
+            if result is not None:
+                waveform, sr = result
+                return ({"waveform": waveform.unsqueeze(0), "sample_rate": sr}, True)
+        return (None, False)
+
+
 NODE_CLASS_MAPPINGS = {
     "Load Audio Any": LoadAudioAny,
     "Load Audio Any Optional": LoadAudioAnyOptional,
     "Load Audio Any Stereo": LoadAudioAnyStereo,
+    "Load Audio Any Stereo Optional": LoadAudioAnyStereoOptional,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "Load Audio Any": "Audio - Load (URL or Local)",
     "Load Audio Any Optional": "Audio - Load (URL or Local, Optional)",
     "Load Audio Any Stereo": "Audio - Load Stereo (URL or Local)",
+    "Load Audio Any Stereo Optional": "Audio - Load Stereo (URL or Local, Optional)",
 }
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
