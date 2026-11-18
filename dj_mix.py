@@ -123,7 +123,7 @@ def _stereo(y):
 
 
 def crossfade(a, b, sr, overlap_s=4.0, curve="bass_swap", beat_align=True, match_tempo=True,
-              bpm_a=0.0, bpm_b=0.0, max_stretch=0.08):
+              bpm_a=0.0, bpm_b=0.0, max_stretch=0.08, trans=None, trans_gain_db=-6.0, trans_ends="overlap_end"):
     """Join a (earlier) and b (later) with an overlapped transition. Returns (audio [2,T], info dict)."""
     a, b = _stereo(a), _stereo(b)
     info = {}
@@ -167,6 +167,11 @@ def crossfade(a, b, sr, overlap_s=4.0, curve="bass_swap", beat_align=True, match
         ga, gb = _gains(ov, "linear" if curve == "linear" else "equal_power")
         mix = seg_a * ga + seg_b * gb
     out = np.concatenate([a[:, :tj], mix, b[:, ov:]], axis=1)
+    if trans is not None:
+        end_at = tj + (ov // 2 if trans_ends == "overlap_midpoint" else ov)
+        fade = 0.8 * trans.shape[-1] / sr
+        out = overlay_at(out, trans, sr, end_at / sr, "end_at", trans_gain_db, fade)
+        info["transition"] = trans_ends
     peak = float(np.abs(out).max())
     if peak > 1.0:
         out = out / peak
@@ -226,6 +231,9 @@ class AudioCrossfadeDJ:
             "match_tempo": ("BOOLEAN", {"default": True}),
             "max_stretch_percent": ("FLOAT", {"default": 8.0, "min": 0.0, "max": 25.0, "step": 0.5}),
         }, "optional": {
+            "transition": ("AUDIO",),
+            "transition_gain_db": ("FLOAT", {"default": -6.0, "min": -60.0, "max": 12.0, "step": 0.5}),
+            "transition_ends_at": (["overlap_end", "overlap_midpoint"], {"default": "overlap_end"}),
             "bpm_a": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 300.0, "step": 0.1}),
             "bpm_b": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 300.0, "step": 0.1}),
         }}
@@ -236,13 +244,17 @@ class AudioCrossfadeDJ:
     CATEGORY = "audio/dj"
 
     def run(self, audio_a, audio_b, overlap_seconds, curve, beat_align, match_tempo, max_stretch_percent,
-            bpm_a=0.0, bpm_b=0.0):
+            transition=None, transition_gain_db=-6.0, transition_ends_at="overlap_end", bpm_a=0.0, bpm_b=0.0):
         a, sra = _to_np(audio_a)
         b, srb = _to_np(audio_b)
         sr = max(sra, srb)
         a, b = _match_sr(_stereo(a), sra, sr), _match_sr(_stereo(b), srb, sr)
+        tr = None
+        if transition is not None:
+            t, srt = _to_np(transition)
+            tr = _match_sr(_stereo(t), srt, sr)
         y, info = crossfade(a, b, sr, overlap_seconds, curve, beat_align, match_tempo, bpm_a, bpm_b,
-                            max_stretch_percent / 100.0)
+                            max_stretch_percent / 100.0, tr, transition_gain_db, transition_ends_at)
         text = ", ".join(f"{k}={v}" for k, v in info.items())
         print(f"[AudioCrossfadeDJ] {text}")
         return (_to_audio(y, sr), text)
