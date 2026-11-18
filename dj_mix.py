@@ -56,30 +56,51 @@ def estimate_tempo(env, sr, hop=512, lo=70.0, hi=180.0, prior=120.0):
     return float(best)
 
 
+def _lattice_best(env, fps, period_frames, steps):
+    n = len(env)
+    xs = np.arange(n, dtype=np.float64)
+    best_phase, best = 0.0, -1.0
+    for k in range(steps):
+        phase = k * period_frames / steps
+        idx = np.arange(phase, n - 1, period_frames)
+        sc = float(np.interp(idx, xs, env).sum()) / max(len(idx), 1)
+        if sc > best:
+            best, best_phase = sc, phase
+    return best_phase, best
+
+
 def beat_grid(env, sr, bpm, hop=512):
     """Phase of the beat lattice (seconds of the first beat) and the beat period in seconds for a given BPM."""
     period = 60.0 / bpm
     fps = sr / hop
-    n = len(env)
     p = period * fps
-    if n < p * 2:
+    if len(env) < p * 2:
         return 0.0, period
-    best_phase, best_score = 0.0, -1.0
-    steps = max(8, int(p))
-    for k in range(steps):
-        phase = k * p / steps
-        idx = np.arange(phase, n - 1, p)
-        score = float(np.interp(idx, np.arange(n), env).sum())
-        if score > best_score:
-            best_score, best_phase = score, phase
-    return best_phase / fps, period
+    phase, _ = _lattice_best(env, fps, p, max(16, int(p * 2)))
+    return phase / fps, period
 
 
-def detect(y, sr, bpm_hint=0.0, hop=512):
+def refine_tempo(env, sr, coarse, hop=512, span=0.03, step=0.03):
+    """Fine BPM search: the lattice that explains the most onset energy over the WHOLE window wins, so a 1% error
+    (which would drift half a second over 50 s) is corrected."""
+    fps = sr / hop
+    best_bpm, best = coarse, -1.0
+    for bpm in np.arange(coarse * (1 - span), coarse * (1 + span) + 1e-9, step):
+        p = fps * 60.0 / bpm
+        if len(env) < p * 2:
+            continue
+        _, sc = _lattice_best(env, fps, p, max(12, int(p)))
+        if sc > best:
+            best, best_bpm = sc, float(bpm)
+    return best_bpm
+
+
+def detect(y, sr, bpm_hint=0.0, hop=256):
     env = onset_envelope(y, sr, hop)
-    bpm = bpm_hint if bpm_hint > 0 else estimate_tempo(env, sr, hop)
-    if bpm <= 0:
+    coarse = bpm_hint if bpm_hint > 0 else estimate_tempo(env, sr, hop)
+    if coarse <= 0:
         return 0.0, 0.0, 0.0
+    bpm = refine_tempo(env, sr, coarse, hop) if bpm_hint <= 0 else coarse
     t0, period = beat_grid(env, sr, bpm, hop)
     return bpm, t0, period
 
@@ -298,30 +319,59 @@ def crossfade(a, b, sr, overlap_s=4.0, curve="bass_swap", beat_align=True, match
 
 
 
+def bar_phase(env, sr, bpm, hop=256, beats_per_bar=4):
+    """Seconds (within the first bar) of the strongest bar line for a given tempo, plus the bar period in seconds."""
+    fps = sr / hop
+    p = fps * 60.0 / bpm * beats_per_bar
+    if len(env) < p * 2:
+        return 0.0, 60.0 / bpm * beats_per_bar
+    phase, _ = _lattice_best(env, fps, p, max(16, int(p)))
+    return phase / fps, 60.0 / bpm * beats_per_bar
+
+
+def fit_tempo_to(env, sr, target_bpm, hop=256, span=0.10, step=0.002):
+    """Which native tempo near target_bpm (or at half/double) makes the layer's hits sit on a beat lattice best?
+    Returns (native_bpm, score). Scans a fine grid, so triplet/dotted detector confusions do not matter."""
+    fps = sr / hop
+    best, best_bpm = -1.0, target_bpm
+    for mult, w in ((1.0, 1.0),):
+        c0 = target_bpm * mult
+        for bpm in np.arange(c0 * (1 - span), c0 * (1 + span) + 1e-9, c0 * step):
+            p = fps * 60.0 / bpm
+            if len(env) < p * 2:
+                continue
+            _, sc = _lattice_best(env, fps, p, max(12, int(p)))
+            if sc * w > best:
+                best, best_bpm = sc * w, float(bpm)
+    return best_bpm, best
+
+
 def place_layer(base, layer, sr, start_s, end_s, gain_db=-3.0, fade_in_s=2.0, fade_out_s=2.0, align=True,
                 match_tempo=True, max_stretch=0.10, loop=True, bpm_base=0.0):
-    """Lay a stem over `base` between start_s and end_s, locked to base's beat grid.
-    The layer is tempo-matched (within max_stretch, half/double allowed), its first beat is put on a base beat, it is
-    looped to fill the region if it is shorter, and faded in/out. Returns (audio [2,T], info dict)."""
+    """Lay a stem over `base` between start_s and end_s, locked to base's beat grid and bar lines.
+    The layer's tempo is FITTED to the base tempo (scan within +-10%, half/double allowed) and it is sped up/down
+    by the needed factor (if within max_stretch), its bar line is put on a base bar line, it is looped to fill the
+    region if it is shorter, and faded in/out. Returns (audio [2,T], info dict)."""
     base, layer = _stereo(base), _stereo(layer)
     info = {}
-    bb = detect(base[:, : int(sr * 40)], sr, bpm_base)
-    info["bpm_base"] = round(bb[0], 1)
+    hop = 256
+    env_b = onset_envelope(base[:, : int(sr * 40)], sr, hop)
+    bpm_b = bpm_base if bpm_base > 0 else refine_tempo(env_b, sr, estimate_tempo(env_b, sr, hop), hop)
+    info["bpm_base"] = round(bpm_b, 2)
     ts, te = float(start_s), float(end_s)
-    if align and bb[0] > 0:
-        bl = detect(layer[:, : int(sr * 30)], sr)
-        info["bpm_layer"] = round(bl[0], 1)
-        if match_tempo and bl[0] > 0:
-            rate = bb[0] / bl[0]
-            for r in (rate, rate * 2, rate / 2):
-                if abs(r - 1.0) <= max_stretch:
-                    layer = change_speed(layer, r)
-                    info["stretch"] = round(r, 4)
-                    break
-        bl = detect(layer[:, : int(sr * 30)], sr, bb[0])
-        layer = layer[:, int(bl[1] * sr):]            # the layer now starts on its first beat
-        t0, per = bb[1], bb[2]
-        snap = lambda t: t0 + round((t - t0) / per) * per
+    if align and bpm_b > 0:
+        bar0_b, bar_b = bar_phase(env_b, sr, bpm_b, hop)
+        env_l = onset_envelope(layer[:, : int(sr * 30)], sr, hop)
+        c, _ = fit_tempo_to(env_l, sr, bpm_b, hop)
+        info["bpm_layer_fit"] = round(c, 2)
+        rate = bpm_b / c
+        if match_tempo and abs(rate - 1.0) <= max_stretch and abs(rate - 1.0) > 0.0005:
+            layer = change_speed(layer, rate)
+            env_l = onset_envelope(layer[:, : int(sr * 30)], sr, hop)
+            info["stretch"] = round(rate, 4)
+        bar0_l, _ = bar_phase(env_l, sr, bpm_b if match_tempo else c, hop)
+        layer = layer[:, int(bar0_l * sr):]                 # the layer now starts on its own bar line
+        snap = lambda t: bar0_b + round((t - bar0_b) / bar_b) * bar_b
         ts, te = max(0.0, snap(ts)), snap(te)
         info["start_s"], info["end_s"] = round(ts, 3), round(te, 3)
     n0, n1 = int(ts * sr), int(te * sr)
