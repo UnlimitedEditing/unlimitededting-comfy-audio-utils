@@ -122,6 +122,93 @@ def _stereo(y):
     return y[:2].astype(np.float32)
 
 
+
+# ---------------------------------------------------------------- DJ transition styles
+STYLE_NAMES = ["equal_power", "bass_swap", "eq_3band", "filter_sweep", "echo_out", "reverb_out", "loop_roll", "linear"]
+
+
+def _smooth(x, lo, hi):
+    """0 below lo, 1 above hi, smoothstep between."""
+    t = np.clip((x - lo) / max(hi - lo, 1e-6), 0.0, 1.0)
+    return (t * t * (3 - 2 * t)).astype(np.float32)
+
+
+def _split3(y, sr, f1=200.0, f2=2500.0):
+    lo = signal.sosfiltfilt(signal.butter(4, f1, btype="low", fs=sr, output="sos"), y, axis=1)
+    hi = signal.sosfiltfilt(signal.butter(4, f2, btype="high", fs=sr, output="sos"), y, axis=1)
+    return lo, y - lo - hi, hi
+
+
+def _eq_3band(seg_a, seg_b, sr):
+    """A DJ's three-knob blend: b's highs come in first, mids ride across the middle, the bass swaps last (and a's
+    highs go early, mids mid, bass last), so the two kicks never fight for the low end."""
+    n = seg_a.shape[1]
+    x = np.linspace(0.0, 1.0, n, dtype=np.float32)
+    la, ma, ha = _split3(seg_a, sr)
+    lb, mb, hb = _split3(seg_b, sr)
+    low_b = _smooth(x, 0.46, 0.54)
+    mid_b = _smooth(x, 0.25, 0.75)
+    hi_b = _smooth(x, 0.0, 0.5)
+    return (la * (1 - low_b) + lb * low_b) + (ma * (1 - mid_b) + mb * mid_b) + (ha * (1 - hi_b) + hb * hi_b)
+
+
+def _sweep(y, sr, kind, f0, f1, steps=14):
+    """Time-varying high/low-pass: cutoff glides exponentially f0 -> f1 across y. Blends a bank of fixed filters."""
+    n = y.shape[1]
+    cuts = np.geomspace(min(f0, f1), max(f0, f1), steps)
+    bank = [signal.sosfilt(signal.butter(2, min(c, sr * 0.45), btype=kind, fs=sr, output="sos"), y, axis=1) for c in cuts]
+    pos = np.linspace(np.log(f0), np.log(f1), n)
+    idx = np.interp(pos, np.log(cuts), np.arange(steps))
+    lo = np.clip(np.floor(idx).astype(int), 0, steps - 2)
+    w = (idx - lo).astype(np.float32)
+    out = np.zeros_like(y)
+    stack = np.stack(bank)  # [steps, C, T]
+    t = np.arange(n)
+    out = stack[lo, :, t].T * (1 - w)[None] + stack[lo + 1, :, t].T * w[None]
+    return out.astype(np.float32)
+
+
+def _filter_sweep(seg_a, seg_b, sr):
+    """Outgoing track is high-passed up and out (thinning to a hiss), incoming opens from a muffled low-pass."""
+    n = seg_a.shape[1]
+    x = np.linspace(0.0, 1.0, n, dtype=np.float32)
+    a = _sweep(seg_a, sr, "highpass", 40.0, 3500.0) * (1 - _smooth(x, 0.55, 1.0))[None]
+    b = _sweep(seg_b, sr, "lowpass", 250.0, 18000.0) * _smooth(x, 0.0, 0.45)[None]
+    return a + b
+
+
+def _delay_tail(y, sr, delay_s, taps=5, feedback=0.55):
+    d = max(1, int(delay_s * sr))
+    out = np.zeros((y.shape[0], y.shape[1] + d * taps), dtype=np.float32)
+    for k in range(1, taps + 1):
+        out[:, d * k: d * k + y.shape[1]] += y * (feedback ** k)
+    return out
+
+
+def _reverb_tail(y, sr, seconds=2.5):
+    n = int(seconds * sr)
+    rng = np.random.default_rng(7)
+    ir = rng.standard_normal((2, n)).astype(np.float32) * np.exp(-np.linspace(0, 7.0, n))[None].astype(np.float32)
+    ir = signal.sosfilt(signal.butter(2, 5000.0, btype="low", fs=sr, output="sos"), ir, axis=1)
+    wet = np.stack([signal.fftconvolve(y[c], ir[c]) for c in range(2)]).astype(np.float32)
+    return wet * 0.05
+
+
+def _loop_roll(a, tj_beats_start, period_s, sr):
+    """Stutter the last bar before the cut: loops of 1, 1/2, 1/4, 1/8 beat, each filling one beat."""
+    p = int(period_s * sr)
+    base = a[:, tj_beats_start: tj_beats_start + 4 * p]
+    if base.shape[1] < 4 * p:
+        return a[:, tj_beats_start:]
+    parts = [base[:, :p]]
+    for k, div in enumerate((2, 4, 8), start=1):
+        seg = base[:, k * p: k * p + p // div]
+        reps = int(np.ceil(p / max(seg.shape[1], 1)))
+        parts.append(np.tile(seg, (1, reps))[:, :p])
+    return np.concatenate(parts, axis=1)
+
+
+
 def crossfade(a, b, sr, overlap_s=4.0, curve="bass_swap", beat_align=True, match_tempo=True,
               bpm_a=0.0, bpm_b=0.0, max_stretch=0.08, trans=None, trans_gain_db=-6.0, trans_ends="overlap_end"):
     """Join a (earlier) and b (later) with an overlapped transition. Returns (audio [2,T], info dict)."""
@@ -161,12 +248,43 @@ def crossfade(a, b, sr, overlap_s=4.0, curve="bass_swap", beat_align=True, match
         return np.concatenate([a, b], axis=1), info
     seg_a = a[:, tj: tj + ov]
     seg_b = b[:, :ov]
-    if curve == "bass_swap" and ov > 4096:
+    period_s = ba[2] if (beat_align and ba[0] > 0) else max(ov / sr / 4.0, 0.25)
+    tail = None
+    if curve == "loop_roll" and beat_align and ba[0] > 0 and ov >= int(4 * period_s * sr * 0.9):
+        # stutter the last bar of a, then cut straight to b on its first beat
+        p = int(period_s * sr)
+        start = max(0, tj + ov - 4 * p)
+        rolled = _loop_roll(a, start, period_s, sr)
+        out = np.concatenate([a[:, :start], rolled, b[:, :]], axis=1)
+        info["overlap_s"] = 0.0
+        info["style"] = "loop_roll"
+        peak = float(np.abs(out).max())
+        return (out / peak if peak > 1.0 else out).astype(np.float32), info
+    if ov > 4096 and curve == "bass_swap":
         mix = _bass_swap(seg_a, seg_b, sr)
+    elif ov > 8192 and curve == "eq_3band":
+        mix = _eq_3band(seg_a, seg_b, sr)
+    elif ov > 8192 and curve == "filter_sweep":
+        mix = _filter_sweep(seg_a, seg_b, sr)
+    elif curve in ("echo_out", "reverb_out"):
+        # a is cut quickly (equal-power fast fade) while its echo/reverb tail keeps ringing under b
+        x = np.linspace(0.0, 1.0, ov, dtype=np.float32)
+        fast_out = np.cos(np.clip(x / 0.5, 0, 1) * math.pi / 2)[None]
+        dry_a = seg_a * fast_out
+        gb = np.sin(np.clip((x - 0.1) / 0.8, 0, 1) * math.pi / 2)[None]
+        mix = dry_a + seg_b * gb
+        wet = _delay_tail(dry_a, sr, period_s * 0.75) if curve == "echo_out" else _reverb_tail(dry_a, sr)
+        tail = wet
     else:
         ga, gb = _gains(ov, "linear" if curve == "linear" else "equal_power")
         mix = seg_a * ga + seg_b * gb
+    info["style"] = curve if curve in STYLE_NAMES else "equal_power"
     out = np.concatenate([a[:, :tj], mix, b[:, ov:]], axis=1)
+    if tail is not None:
+        need = tj + tail.shape[1]
+        if need > out.shape[1]:
+            out = np.concatenate([out, np.zeros((2, need - out.shape[1]), dtype=np.float32)], axis=1)
+        out[:, tj: tj + tail.shape[1]] += tail
     if trans is not None:
         end_at = tj + (ov // 2 if trans_ends == "overlap_midpoint" else ov)
         fade = 0.8 * trans.shape[-1] / sr
@@ -226,7 +344,7 @@ class AudioCrossfadeDJ:
         return {"required": {
             "audio_a": ("AUDIO",), "audio_b": ("AUDIO",),
             "overlap_seconds": ("FLOAT", {"default": 4.0, "min": 0.0, "max": 30.0, "step": 0.1}),
-            "curve": (["bass_swap", "equal_power", "linear"], {"default": "bass_swap"}),
+            "curve": (STYLE_NAMES, {"default": "equal_power"}),
             "beat_align": ("BOOLEAN", {"default": True}),
             "match_tempo": ("BOOLEAN", {"default": True}),
             "max_stretch_percent": ("FLOAT", {"default": 8.0, "min": 0.0, "max": 25.0, "step": 0.5}),
