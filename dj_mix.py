@@ -297,6 +297,58 @@ def crossfade(a, b, sr, overlap_s=4.0, curve="bass_swap", beat_align=True, match
     return out.astype(np.float32), info
 
 
+
+def place_layer(base, layer, sr, start_s, end_s, gain_db=-3.0, fade_in_s=2.0, fade_out_s=2.0, align=True,
+                match_tempo=True, max_stretch=0.10, loop=True, bpm_base=0.0):
+    """Lay a stem over `base` between start_s and end_s, locked to base's beat grid.
+    The layer is tempo-matched (within max_stretch, half/double allowed), its first beat is put on a base beat, it is
+    looped to fill the region if it is shorter, and faded in/out. Returns (audio [2,T], info dict)."""
+    base, layer = _stereo(base), _stereo(layer)
+    info = {}
+    bb = detect(base[:, : int(sr * 40)], sr, bpm_base)
+    info["bpm_base"] = round(bb[0], 1)
+    ts, te = float(start_s), float(end_s)
+    if align and bb[0] > 0:
+        bl = detect(layer[:, : int(sr * 30)], sr)
+        info["bpm_layer"] = round(bl[0], 1)
+        if match_tempo and bl[0] > 0:
+            rate = bb[0] / bl[0]
+            for r in (rate, rate * 2, rate / 2):
+                if abs(r - 1.0) <= max_stretch:
+                    layer = change_speed(layer, r)
+                    info["stretch"] = round(r, 4)
+                    break
+        bl = detect(layer[:, : int(sr * 30)], sr, bb[0])
+        layer = layer[:, int(bl[1] * sr):]            # the layer now starts on its first beat
+        t0, per = bb[1], bb[2]
+        snap = lambda t: t0 + round((t - t0) / per) * per
+        ts, te = max(0.0, snap(ts)), snap(te)
+        info["start_s"], info["end_s"] = round(ts, 3), round(te, 3)
+    n0, n1 = int(ts * sr), int(te * sr)
+    want = max(0, n1 - n0)
+    if want == 0:
+        return base, info
+    if layer.shape[1] < want and loop:
+        reps = int(np.ceil(want / layer.shape[1]))
+        layer = np.tile(layer, (1, reps))
+        info["looped"] = reps
+    layer = layer[:, :want].copy()
+    g = 10 ** (gain_db / 20.0)
+    fi, fo = min(int(fade_in_s * sr), want // 2), min(int(fade_out_s * sr), want // 2)
+    if fi > 0:
+        layer[:, :fi] *= np.sin(np.linspace(0, math.pi / 2, fi, dtype=np.float32))[None]
+    if fo > 0:
+        layer[:, -fo:] *= np.cos(np.linspace(0, math.pi / 2, fo, dtype=np.float32))[None]
+    total = max(base.shape[1], n0 + want)
+    out = np.zeros((2, total), dtype=np.float32)
+    out[:, : base.shape[1]] += base
+    out[:, n0: n0 + want] += layer * g
+    peak = float(np.abs(out).max())
+    if peak > 1.0:
+        out = out / peak
+    return out, info
+
+
 def overlay_at(base, over, sr, at_s=-1.0, mode="end_at", gain_db=-3.0, fade_in_s=0.0):
     """Layer `over` on `base`. end_at: `over` finishes at at_s (-1 = end of base). start_at: `over` begins at at_s."""
     base, over = _stereo(base), _stereo(over)
@@ -402,6 +454,39 @@ class AudioOverlayAt:
         return (_to_audio(y, sr),)
 
 
+
+class AudioLayerPlace:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "base": ("AUDIO",), "layer": ("AUDIO",),
+            "start_seconds": ("FLOAT", {"default": 8.0, "min": 0.0, "max": 3600.0, "step": 0.01}),
+            "end_seconds": ("FLOAT", {"default": 24.0, "min": 0.0, "max": 3600.0, "step": 0.01}),
+            "gain_db": ("FLOAT", {"default": -3.0, "min": -60.0, "max": 12.0, "step": 0.5}),
+            "fade_in_seconds": ("FLOAT", {"default": 2.0, "min": 0.0, "max": 60.0, "step": 0.1}),
+            "fade_out_seconds": ("FLOAT", {"default": 2.0, "min": 0.0, "max": 60.0, "step": 0.1}),
+            "beat_lock": ("BOOLEAN", {"default": True}),
+            "max_stretch_percent": ("FLOAT", {"default": 10.0, "min": 0.0, "max": 25.0, "step": 0.5}),
+        }}
+
+    RETURN_TYPES = ("AUDIO", "STRING")
+    RETURN_NAMES = ("audio", "info")
+    FUNCTION = "run"
+    CATEGORY = "audio/dj"
+
+    def run(self, base, layer, start_seconds, end_seconds, gain_db, fade_in_seconds, fade_out_seconds, beat_lock,
+            max_stretch_percent):
+        b, srb = _to_np(base)
+        l, srl = _to_np(layer)
+        sr = max(srb, srl)
+        y, info = place_layer(_match_sr(_stereo(b), srb, sr), _match_sr(_stereo(l), srl, sr), sr, start_seconds,
+                              end_seconds, gain_db, fade_in_seconds, fade_out_seconds, beat_lock, True,
+                              max_stretch_percent / 100.0)
+        text = ", ".join(f"{k}={v}" for k, v in info.items())
+        print(f"[AudioLayerPlace] {text}")
+        return (_to_audio(y, sr), text)
+
+
 class AudioBPM:
     @classmethod
     def INPUT_TYPES(cls):
@@ -424,9 +509,11 @@ NODE_CLASS_MAPPINGS = {
     "Audio Crossfade DJ": AudioCrossfadeDJ,
     "Audio Overlay At": AudioOverlayAt,
     "Audio BPM": AudioBPM,
+    "Audio Layer Place": AudioLayerPlace,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "Audio Crossfade DJ": "Audio - Crossfade (DJ, beat-aware)",
     "Audio Overlay At": "Audio - Overlay At Time",
     "Audio BPM": "Audio - BPM Estimate",
+    "Audio Layer Place": "Audio - Place Layer (beat-locked)",
 }
