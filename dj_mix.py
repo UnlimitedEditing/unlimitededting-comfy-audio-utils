@@ -423,12 +423,28 @@ def _atempo(y, sr, rate):
         return change_speed(y, rate)
 
 
-def make_loop(y, sr, bpm, bars=8, beats_per_bar=4, max_stretch=0.15, preserve_pitch=True, seam_ms=40.0):
-    """Cut a generated stem into an exact whole-bar loop at `bpm`.
-    1. fit the stem's own tempo to `bpm` (scan +-max_stretch) and stretch it (pitch preserved when possible),
-    2. start on the stem's strongest bar line (the one whose end matches its start best),
-    3. cut exactly bars * beats_per_bar * 60 / bpm seconds,
-    4. blend the head of the loop with the audio that would have followed its end, so tiling it has no seam.
+def _band_feat(y, sr, a, b, n_seg=8, n_bands=24):
+    """Coarse spectro-temporal fingerprint of y[a:b]: log band energies in n_seg slices (for comparing musical content)."""
+    seg = y[:, a:b].mean(0)
+    if len(seg) < 64:
+        return np.zeros(n_seg * n_bands, dtype=np.float32)
+    f, t, Z = signal.stft(seg, fs=sr, nperseg=1024, noverlap=768, boundary=None, padded=False)
+    P = np.abs(Z) ** 2
+    edges = np.geomspace(60, min(12000, sr / 2 - 1), n_bands + 1)
+    bands = np.stack([P[(f >= edges[i]) & (f < edges[i + 1])].sum(0) for i in range(n_bands)])      # [bands, frames]
+    cols = np.array_split(np.arange(bands.shape[1]), n_seg)
+    out = np.stack([np.log1p(1e4 * bands[:, c].mean(1)) if len(c) else np.zeros(n_bands) for c in cols])
+    return out.reshape(-1).astype(np.float32)
+
+
+def make_loop(y, sr, bpm, bars=8, beats_per_bar=4, max_stretch=0.15, preserve_pitch=True, seam_beats=1.0, fit=True):
+    """Cut a generated stem into an exact whole-bar loop at `bpm` that repeats seamlessly.
+    1. fit the stem's tempo to `bpm` (scan +-max_stretch) and stretch it (pitch kept when possible),
+    2. find the bar line from the low band (kick/bass), snapped to the exact beat lattice,
+    3. among the candidate bar-aligned windows pick the one whose END leads best into its START (compares the audio that
+       follows the end with the head, and the last beat with the beat that came before the start),
+    4. cut exactly bars * beats_per_bar * 60 / bpm seconds and blend the last `seam_beats` of the loop with the audio that
+       preceded its start (equal power), so the wrap point is waveform-continuous and musically natural.
     Returns (audio [2, T], info dict)."""
     y = _stereo(y)
     info = {}
@@ -444,53 +460,61 @@ def make_loop(y, sr, bpm, bars=8, beats_per_bar=4, max_stretch=0.15, preserve_pi
     bar_s = beats_per_bar * 60.0 / bpm
     beat_s = 60.0 / bpm
     loop_n = int(round(bars * bar_s * sr))
-    # Bar line from the LOW band (kick / bass): broadband flux is dominated by hats and claps on drum stems, which put
-    # the loop start half a beat off the kick. Fall back to broadband when there is no low-band rhythm (pads, textures).
     lo = signal.sosfiltfilt(signal.butter(4, 160.0, btype="low", fs=sr, output="sos"), y[:, : int(sr * 40)].mean(0)[None], axis=1)
     env_lo = onset_envelope(lo, sr, hop)
     rich = float(env_lo.max()) > 0 and float(np.percentile(env_lo, 95)) > 0.25 * float(np.percentile(env, 95))
     use = env_lo if rich else env
     info["bar_from"] = "low band" if rich else "broadband"
     bar0, _ = bar_phase(use, sr, bpm, hop, beats_per_bar)
-    # snap the bar line onto the exact beat lattice of the same envelope, so beat and bar phases cannot disagree
     t0_beat, _ = beat_grid(use, sr, bpm, hop)
-    bar0 = t0_beat + round((bar0 - t0_beat) / beat_s) * beat_s
-    bar0 = bar0 % bar_s
-    seam = int(seam_ms / 1000.0 * sr)
+    bar0 = (t0_beat + round((bar0 - t0_beat) / beat_s) * beat_s) % bar_s
     total = y.shape[1]
-    best, best_s = None, None
-    for k in range(0, 8):
+    delta = int(round(seam_beats * beat_s * sr))
+    cands = []
+    for k in range(0, 40):
         s0 = int(round((bar0 + k * bar_s) * sr))
         e0 = s0 + loop_n
-        if e0 + seam > total:
+        if e0 > total:
             break
-        a = y[:, s0: s0 + int(0.1 * sr)]
-        b = y[:, e0 - int(0.1 * sr): e0]
-        ra, rb = float(np.sqrt(np.mean(a ** 2)) + 1e-6), float(np.sqrt(np.mean(b ** 2)) + 1e-6)
-        score = abs(np.log(ra / rb))
-        if best is None or score < best:
-            best, best_s = score, s0
-    if best_s is None:                           # not enough audio: take what fits from the first bar line and pad by tiling
+        cands.append((s0, e0))
+    best, best_sc = None, None
+    for s0, e0 in cands:
+        has_pre, has_cont = s0 - delta >= 0, e0 + delta <= total
+        sc = 0.0
+        if delta > 0 and fit:
+            fa, fb = _band_feat(y, sr, e0 - delta, e0), _band_feat(y, sr, s0, s0 + delta)
+            if has_pre:
+                sc += float(np.linalg.norm(_band_feat(y, sr, s0 - delta, s0) - fa))
+            else:
+                sc += 50.0                       # no pre-roll to blend with: strongly disfavoured
+            if has_cont:
+                sc += float(np.linalg.norm(_band_feat(y, sr, e0, e0 + delta) - fb))
+            else:
+                sc += 25.0
+        if best_sc is None or sc < best_sc:
+            best, best_sc = (s0, e0, has_pre), sc
+    if best is None:                            # not enough audio for even one window: tile what exists from the first bar line
         s0 = int(round(bar0 * sr))
         seg = y[:, s0:]
         reps = int(np.ceil(loop_n / max(seg.shape[1], 1)))
         loop = np.tile(seg, (1, reps))[:, :loop_n]
         info["short"] = True
     else:
-        loop = y[:, best_s: best_s + loop_n].copy()
-        cont = y[:, best_s + loop_n: best_s + loop_n + seam]
-        if cont.shape[1] == seam and seam > 8:
-            w = np.linspace(0.0, 1.0, seam, dtype=np.float32)[None]
-            w = np.sin(w * math.pi / 2) ** 2
-            loop[:, :seam] = loop[:, :seam] * w + cont * (1.0 - w)
-        info["start_s"] = round(best_s / sr, 3)
+        s0, e0, has_pre = best
+        loop = y[:, s0:e0].copy()
+        if has_pre and delta > 8:
+            pre = y[:, s0 - delta: s0]
+            t = np.linspace(0.0, 1.0, delta, dtype=np.float32)[None]
+            loop[:, loop_n - delta:] = loop[:, loop_n - delta:] * np.cos(t * math.pi / 2) + pre * np.sin(t * math.pi / 2)
+        info["start_s"] = round(s0 / sr, 3)
+        info["fit_score"] = round(best_sc, 2)
+        info["candidates"] = len(cands)
     info["loop_s"] = round(loop.shape[1] / sr, 4)
     info["bars"] = bars
     peak = float(np.abs(loop).max())
     if peak > 1.0:
         loop = loop / peak
     return loop.astype(np.float32), info
-
 
 def overlay_at(base, over, sr, at_s=-1.0, mode="end_at", gain_db=-3.0, fade_in_s=0.0):
     """Layer `over` on `base`. end_at: `over` finishes at at_s (-1 = end of base). start_at: `over` begins at at_s."""
@@ -641,7 +665,7 @@ class AudioMakeLoop:
             "beats_per_bar": ("INT", {"default": 4, "min": 1, "max": 12}),
             "max_stretch_percent": ("FLOAT", {"default": 15.0, "min": 0.0, "max": 30.0, "step": 0.5}),
             "preserve_pitch": ("BOOLEAN", {"default": True}),
-            "seam_ms": ("FLOAT", {"default": 40.0, "min": 0.0, "max": 500.0, "step": 5.0}),
+            "seam_beats": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 4.0, "step": 0.25}),
         }}
 
     RETURN_TYPES = ("AUDIO", "STRING")
@@ -649,10 +673,10 @@ class AudioMakeLoop:
     FUNCTION = "run"
     CATEGORY = "audio/dj"
 
-    def run(self, audio, bpm, bars, beats_per_bar, max_stretch_percent, preserve_pitch, seam_ms):
+    def run(self, audio, bpm, bars, beats_per_bar, max_stretch_percent, preserve_pitch, seam_beats):
         y, sr = _to_np(audio)
         loop, info = make_loop(_stereo(y), sr, bpm, bars, beats_per_bar, max_stretch_percent / 100.0, preserve_pitch,
-                               seam_ms)
+                               seam_beats)
         text = ", ".join(f"{k}={v}" for k, v in info.items())
         print(f"[AudioMakeLoop] {text}")
         return (_to_audio(loop, sr), text)

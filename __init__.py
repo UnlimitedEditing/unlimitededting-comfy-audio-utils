@@ -514,12 +514,20 @@ except Exception as _dj_err:  # never let the DJ nodes break the loaders other w
     print(f"[unlimitededting-comfy-audio-utils] DJ mix nodes not loaded: {_dj_err}")
     _DJ_CLASS_MAPPINGS, _DJ_DISPLAY_MAPPINGS = {}, {}
 
+try:
+    from .arranger import NODE_CLASS_MAPPINGS as _ARR_CLASS_MAPPINGS
+    _ARR_DISPLAY_MAPPINGS = {k: k for k in _ARR_CLASS_MAPPINGS}
+except Exception as _arr_err:
+    print(f"[unlimitededting-comfy-audio-utils] arranger not loaded: {_arr_err}")
+    _ARR_CLASS_MAPPINGS, _ARR_DISPLAY_MAPPINGS = {}, {}
+
 # Expose node(s) to ComfyUI
 NODE_CLASS_MAPPINGS = {
     "Audio Duration": AudioDurationNode,
     "Audio Add Silence": AudioAddSilenceNode,
     **_LOAD_AUDIO_ANY_CLASS_MAPPINGS,
     **_DJ_CLASS_MAPPINGS,
+    **_ARR_CLASS_MAPPINGS,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -527,6 +535,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Audio Add Silence": "Audio - Add Silence",
     **_LOAD_AUDIO_ANY_DISPLAY_MAPPINGS,
     **_DJ_DISPLAY_MAPPINGS,
+    **_ARR_DISPLAY_MAPPINGS,
 }
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
