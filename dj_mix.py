@@ -442,8 +442,20 @@ def make_loop(y, sr, bpm, bars=8, beats_per_bar=4, max_stretch=0.15, preserve_pi
         info["stretch"] = round(rate, 4)
         env = onset_envelope(y[:, : int(sr * 40)], sr, hop)
     bar_s = beats_per_bar * 60.0 / bpm
+    beat_s = 60.0 / bpm
     loop_n = int(round(bars * bar_s * sr))
-    bar0, _ = bar_phase(env, sr, bpm, hop, beats_per_bar)
+    # Bar line from the LOW band (kick / bass): broadband flux is dominated by hats and claps on drum stems, which put
+    # the loop start half a beat off the kick. Fall back to broadband when there is no low-band rhythm (pads, textures).
+    lo = signal.sosfiltfilt(signal.butter(4, 160.0, btype="low", fs=sr, output="sos"), y[:, : int(sr * 40)].mean(0)[None], axis=1)
+    env_lo = onset_envelope(lo, sr, hop)
+    rich = float(env_lo.max()) > 0 and float(np.percentile(env_lo, 95)) > 0.25 * float(np.percentile(env, 95))
+    use = env_lo if rich else env
+    info["bar_from"] = "low band" if rich else "broadband"
+    bar0, _ = bar_phase(use, sr, bpm, hop, beats_per_bar)
+    # snap the bar line onto the exact beat lattice of the same envelope, so beat and bar phases cannot disagree
+    t0_beat, _ = beat_grid(use, sr, bpm, hop)
+    bar0 = t0_beat + round((bar0 - t0_beat) / beat_s) * beat_s
+    bar0 = bar0 % bar_s
     seam = int(seam_ms / 1000.0 * sr)
     total = y.shape[1]
     best, best_s = None, None
