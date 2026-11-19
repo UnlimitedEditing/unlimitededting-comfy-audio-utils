@@ -399,6 +399,87 @@ def place_layer(base, layer, sr, start_s, end_s, gain_db=-3.0, fade_in_s=2.0, fa
     return out, info
 
 
+
+def _atempo(y, sr, rate):
+    """Tempo change that keeps pitch, via ffmpeg's atempo (falls back to a turntable-style speed change)."""
+    import os
+    import shutil
+    import subprocess
+    import tempfile
+    if abs(rate - 1.0) < 5e-4:
+        return y
+    ff = shutil.which("ffmpeg")
+    if not ff or not (0.5 <= rate <= 2.0):
+        return change_speed(y, rate)
+    try:
+        import soundfile as sf
+        d = tempfile.mkdtemp()
+        a, b = os.path.join(d, "in.wav"), os.path.join(d, "out.wav")
+        sf.write(a, y.T, sr, subtype="FLOAT")
+        subprocess.run([ff, "-y", "-loglevel", "error", "-i", a, "-filter:a", f"atempo={rate:.6f}", b], check=True)
+        out, _sr = sf.read(b, dtype="float32", always_2d=True)
+        return out.T.astype(np.float32)
+    except Exception:
+        return change_speed(y, rate)
+
+
+def make_loop(y, sr, bpm, bars=8, beats_per_bar=4, max_stretch=0.15, preserve_pitch=True, seam_ms=40.0):
+    """Cut a generated stem into an exact whole-bar loop at `bpm`.
+    1. fit the stem's own tempo to `bpm` (scan +-max_stretch) and stretch it (pitch preserved when possible),
+    2. start on the stem's strongest bar line (the one whose end matches its start best),
+    3. cut exactly bars * beats_per_bar * 60 / bpm seconds,
+    4. blend the head of the loop with the audio that would have followed its end, so tiling it has no seam.
+    Returns (audio [2, T], info dict)."""
+    y = _stereo(y)
+    info = {}
+    hop = 256
+    env = onset_envelope(y[:, : int(sr * 40)], sr, hop)
+    c, _ = fit_tempo_to(env, sr, bpm, hop, span=max_stretch)
+    rate = bpm / c
+    info["native_bpm_fit"] = round(c, 2)
+    if abs(rate - 1.0) <= max_stretch and abs(rate - 1.0) > 5e-4:
+        y = _atempo(y, sr, rate) if preserve_pitch else change_speed(y, rate)
+        info["stretch"] = round(rate, 4)
+        env = onset_envelope(y[:, : int(sr * 40)], sr, hop)
+    bar_s = beats_per_bar * 60.0 / bpm
+    loop_n = int(round(bars * bar_s * sr))
+    bar0, _ = bar_phase(env, sr, bpm, hop, beats_per_bar)
+    seam = int(seam_ms / 1000.0 * sr)
+    total = y.shape[1]
+    best, best_s = None, None
+    for k in range(0, 8):
+        s0 = int(round((bar0 + k * bar_s) * sr))
+        e0 = s0 + loop_n
+        if e0 + seam > total:
+            break
+        a = y[:, s0: s0 + int(0.1 * sr)]
+        b = y[:, e0 - int(0.1 * sr): e0]
+        ra, rb = float(np.sqrt(np.mean(a ** 2)) + 1e-6), float(np.sqrt(np.mean(b ** 2)) + 1e-6)
+        score = abs(np.log(ra / rb))
+        if best is None or score < best:
+            best, best_s = score, s0
+    if best_s is None:                           # not enough audio: take what fits from the first bar line and pad by tiling
+        s0 = int(round(bar0 * sr))
+        seg = y[:, s0:]
+        reps = int(np.ceil(loop_n / max(seg.shape[1], 1)))
+        loop = np.tile(seg, (1, reps))[:, :loop_n]
+        info["short"] = True
+    else:
+        loop = y[:, best_s: best_s + loop_n].copy()
+        cont = y[:, best_s + loop_n: best_s + loop_n + seam]
+        if cont.shape[1] == seam and seam > 8:
+            w = np.linspace(0.0, 1.0, seam, dtype=np.float32)[None]
+            w = np.sin(w * math.pi / 2) ** 2
+            loop[:, :seam] = loop[:, :seam] * w + cont * (1.0 - w)
+        info["start_s"] = round(best_s / sr, 3)
+    info["loop_s"] = round(loop.shape[1] / sr, 4)
+    info["bars"] = bars
+    peak = float(np.abs(loop).max())
+    if peak > 1.0:
+        loop = loop / peak
+    return loop.astype(np.float32), info
+
+
 def overlay_at(base, over, sr, at_s=-1.0, mode="end_at", gain_db=-3.0, fade_in_s=0.0):
     """Layer `over` on `base`. end_at: `over` finishes at at_s (-1 = end of base). start_at: `over` begins at at_s."""
     base, over = _stereo(base), _stereo(over)
@@ -537,6 +618,34 @@ class AudioLayerPlace:
         return (_to_audio(y, sr), text)
 
 
+
+class AudioMakeLoop:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "audio": ("AUDIO",),
+            "bpm": ("FLOAT", {"default": 124.0, "min": 30.0, "max": 300.0, "step": 0.01}),
+            "bars": ("INT", {"default": 8, "min": 1, "max": 64}),
+            "beats_per_bar": ("INT", {"default": 4, "min": 1, "max": 12}),
+            "max_stretch_percent": ("FLOAT", {"default": 15.0, "min": 0.0, "max": 30.0, "step": 0.5}),
+            "preserve_pitch": ("BOOLEAN", {"default": True}),
+            "seam_ms": ("FLOAT", {"default": 40.0, "min": 0.0, "max": 500.0, "step": 5.0}),
+        }}
+
+    RETURN_TYPES = ("AUDIO", "STRING")
+    RETURN_NAMES = ("audio", "info")
+    FUNCTION = "run"
+    CATEGORY = "audio/dj"
+
+    def run(self, audio, bpm, bars, beats_per_bar, max_stretch_percent, preserve_pitch, seam_ms):
+        y, sr = _to_np(audio)
+        loop, info = make_loop(_stereo(y), sr, bpm, bars, beats_per_bar, max_stretch_percent / 100.0, preserve_pitch,
+                               seam_ms)
+        text = ", ".join(f"{k}={v}" for k, v in info.items())
+        print(f"[AudioMakeLoop] {text}")
+        return (_to_audio(loop, sr), text)
+
+
 class AudioBPM:
     @classmethod
     def INPUT_TYPES(cls):
@@ -560,10 +669,12 @@ NODE_CLASS_MAPPINGS = {
     "Audio Overlay At": AudioOverlayAt,
     "Audio BPM": AudioBPM,
     "Audio Layer Place": AudioLayerPlace,
+    "Audio Make Loop": AudioMakeLoop,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "Audio Crossfade DJ": "Audio - Crossfade (DJ, beat-aware)",
     "Audio Overlay At": "Audio - Overlay At Time",
     "Audio BPM": "Audio - BPM Estimate",
     "Audio Layer Place": "Audio - Place Layer (beat-locked)",
+    "Audio Make Loop": "Audio - Make Loop (exact bars, seam-safe)",
 }
