@@ -532,6 +532,15 @@ except Exception as _cudnn_err:
     print(f"[unlimitededting-comfy-audio-utils] cudnn toggle not loaded: {_cudnn_err}")
     _CUDNN_CLASS_MAPPINGS, _CUDNN_DISPLAY_MAPPINGS = {}, {}
 
+try:
+    from .lowpass import (
+        NODE_CLASS_MAPPINGS as _LP_CLASS_MAPPINGS,
+        NODE_DISPLAY_NAME_MAPPINGS as _LP_DISPLAY_MAPPINGS,
+    )
+except Exception as _lp_err:
+    print(f"[unlimitededting-comfy-audio-utils] lowpass not loaded: {_lp_err}")
+    _LP_CLASS_MAPPINGS, _LP_DISPLAY_MAPPINGS = {}, {}
+
 # Expose node(s) to ComfyUI
 NODE_CLASS_MAPPINGS = {
     "Audio Duration": AudioDurationNode,
@@ -540,6 +549,7 @@ NODE_CLASS_MAPPINGS = {
     **_DJ_CLASS_MAPPINGS,
     **_ARR_CLASS_MAPPINGS,
     **_CUDNN_CLASS_MAPPINGS,
+    **_LP_CLASS_MAPPINGS,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -549,6 +559,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     **_DJ_DISPLAY_MAPPINGS,
     **_ARR_DISPLAY_MAPPINGS,
     **_CUDNN_DISPLAY_MAPPINGS,
+    **_LP_DISPLAY_MAPPINGS,
 }
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
